@@ -36,14 +36,15 @@ The app fails to start, with a message saying what's missing, if these aren't us
 
 ## Using it
 
-The apps' Dockerfiles copy the `formlogin/` package in from a build context:
+The apps' Dockerfiles copy the `formlogin/` package in from a build context, pinned to
+a tag of this repo (point `FORMLOGIN_SRC` at a local checkout to try changes):
 
 ```yaml
 # docker-compose.yml
 build:
   context: .
   additional_contexts:
-    formlogin: ../formlogin   # this repo, checked out next to the app
+    formlogin: ${FORMLOGIN_SRC:-https://github.com/jdogskizzle/formlogin.git#v1.0.0}
 ```
 ```dockerfile
 COPY --from=formlogin formlogin /app/formlogin
