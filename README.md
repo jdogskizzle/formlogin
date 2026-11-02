@@ -61,7 +61,7 @@ a tag of this repo (point `FORMLOGIN_SRC` at a local checkout to try changes):
 build:
   context: .
   additional_contexts:
-    formlogin: ${FORMLOGIN_SRC:-https://github.com/jdogskizzle/formlogin.git#v1.0.0}
+    formlogin: ${FORMLOGIN_SRC:-https://github.com/jdogskizzle/formlogin.git#v2.0.0}
 ```
 ```dockerfile
 COPY --from=formlogin formlogin /app/formlogin
