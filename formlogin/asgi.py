@@ -1,7 +1,7 @@
 """formlogin for FastAPI / Starlette apps:
 
     import formlogin, formlogin.asgi
-    login = formlogin.Login.from_env("LEDGER", "ledger", "/data/session.key", title="Ledger")
+    login = formlogin.Login.from_env("LEDGER", "ledger", "/data", title="Ledger")
     formlogin.asgi.install(app, login)
 
 Adds a middleware that answers /login and /logout, gates everything else, and adds the

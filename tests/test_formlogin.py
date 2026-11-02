@@ -17,8 +17,9 @@ HASH = formlogin.hash_password("correct horse battery")
 
 
 def make(**kw):
-    d = tempfile.mkdtemp()
-    return formlogin.Login("app", "me", HASH, os.path.join(d, "session.key"), **kw)
+    kw.setdefault("username", "me")
+    kw.setdefault("password_hash", HASH)
+    return formlogin.Login("app", tempfile.mkdtemp(), **kw)
 
 
 class Hdr(dict):
@@ -40,9 +41,11 @@ class Core(unittest.TestCase):
 
     def test_bad_settings_fail_clearly(self):
         with self.assertRaises(SystemExit):
-            formlogin.Login("app", "me", "nope", "/tmp/x")
-        with mock.patch.dict(os.environ, {"X_USERNAME": "me"}, clear=True), self.assertRaises(SystemExit):
-            formlogin.Login.from_env("X", "app", "/tmp/x")
+            make(password_hash="nope")
+        with self.assertRaises(SystemExit):
+            formlogin.Login("app", "/does/not/exist")
+        with mock.patch.dict(os.environ, {"X_PASSWORD_HASH": HASH}, clear=True), self.assertRaises(SystemExit):
+            formlogin.Login.from_env("X", "app", tempfile.mkdtemp())
         with mock.patch.dict(os.environ, {"X_AUTH": "maybe"}, clear=True), self.assertRaises(SystemExit):
             formlogin.Login.from_env("X", "app", "/tmp/x")
         with mock.patch.dict(os.environ, {"X_AUTH": "off"}, clear=True):
@@ -68,7 +71,7 @@ class Core(unittest.TestCase):
         self.assertIsNone(L.handle("GET", "/api/x", h, "1.2.3.4"))
         self.assertEqual(L.handle("GET", "/login", h, "1.2.3.4").status, 303)
         # a different password (or key) invalidates the session
-        other = formlogin.Login("app", "me", formlogin.hash_password("another one!!"), os.path.join(tempfile.mkdtemp(), "k"))
+        other = make(password_hash=formlogin.hash_password("another one!!"))
         self.assertEqual(other.handle("GET", "/api/x", h, "1.2.3.4").status, 401)
 
     def test_html_escaped(self):
@@ -106,6 +109,103 @@ class Core(unittest.TestCase):
         self.assertIsNone(L.handle("GET", "/metrics", Hdr(), "172.18.0.5"))
         self.assertEqual(L.handle("GET", "/metrics", Hdr({"x-forwarded-for": "1.2.3.4"}), "172.18.0.5").status, 303)
         self.assertEqual(L.handle("GET", "/metrics", Hdr(), "8.8.8.8").status, 303)
+
+
+def setup_form(code, user="me", pw="a brand new password", again=None):
+    again = pw if again is None else again
+    return (f"code={code}&username={user}&password={pw.replace(' ', '+')}"
+            f"&again={again.replace(' ', '+')}").encode()
+
+
+class FileAndSetup(unittest.TestCase):
+    def test_setup_page(self):
+        d = tempfile.mkdtemp()
+        L = formlogin.Login("app", d)
+        code = L._setup_code
+        self.assertEqual(len(code), 10)
+        r = L.handle("GET", "/login", Hdr(), "1.2.3.4")
+        self.assertIn(b"Setup code", r.body)
+        self.assertIn(b'name="username"', r.body)
+        self.assertEqual(L.handle("GET", "/api/x", Hdr(), "1.2.3.4").status, 401)
+        self.assertEqual(L.handle("POST", "/login", Hdr(), "1.2.3.4", setup_form("WRONGWRONG")).status, 401)
+        self.assertEqual(L.handle("POST", "/login", Hdr(), "1.2.3.4", setup_form(code, pw="short")).status, 400)
+        self.assertEqual(L.handle("POST", "/login", Hdr(), "1.2.3.4",
+                                  setup_form(code, again="a different password")).status, 400)
+        # dashes, spaces and lower case are fine
+        r = L.handle("POST", "/login", Hdr(), "1.2.3.4", setup_form(f"{code[:5].lower()}-{code[5:]}"))
+        self.assertEqual(r.status, 303)
+        self.assertIsNone(L._setup_code)
+        h = Hdr({"cookie": dict(r.headers)["Set-Cookie"].split(";")[0]})
+        self.assertIsNone(L.handle("GET", "/api/x", h, "1.2.3.4"))
+        self.assertEqual(formlogin.read_login_file(d)["username"], "me")
+        # now it's a normal sign-in page
+        self.assertIn(b"Sign in", L.handle("GET", "/login", Hdr(), "1.2.3.4").body)
+        self.assertEqual(L.handle("POST", "/login", Hdr(), "1.2.3.4", form(pw="a brand new password")).status, 303)
+
+    def test_setup_code_limited(self):
+        L = formlogin.Login("app", tempfile.mkdtemp())
+        for _ in range(formlogin.FAIL_LIMIT):
+            L.handle("POST", "/login", Hdr(), "1.2.3.4", setup_form("WRONGWRONG"))
+        self.assertEqual(L.handle("POST", "/login", Hdr(), "1.2.3.4", setup_form(L._setup_code)).status, 429)
+
+    def test_fixed_username_not_asked(self):
+        L = formlogin.Login("app", tempfile.mkdtemp(), username="boss")
+        self.assertNotIn(b'name="username"', L.handle("GET", "/login", Hdr(), "1.2.3.4").body)
+        r = L.handle("POST", "/login", Hdr(), "1.2.3.4", setup_form(L._setup_code, user=""))
+        self.assertEqual(r.status, 303)
+        self.assertEqual(L.current().username, "boss")
+
+    def test_changed_file_applies_without_restart(self):
+        d = tempfile.mkdtemp()
+        formlogin.write_login_file(d, "me", HASH)
+        L = formlogin.Login("app", d)
+        self.assertIsNone(L._setup_code)
+        r = L.handle("POST", "/login", Hdr(), "1.2.3.4", form())
+        h = Hdr({"cookie": dict(r.headers)["Set-Cookie"].split(";")[0]})
+        self.assertIsNone(L.handle("GET", "/api/x", h, "1.2.3.4"))
+        time.sleep(0.01)
+        formlogin.write_login_file(d, "me", formlogin.hash_password("the second password"))
+        self.assertEqual(L.handle("GET", "/api/x", h, "1.2.3.4").status, 401)  # signed out
+        self.assertEqual(L.handle("POST", "/login", Hdr(), "1.2.3.4", form()).status, 401)
+        self.assertEqual(L.handle("POST", "/login", Hdr(), "1.2.3.4", form(pw="the second password")).status, 303)
+        # a broken file is ignored, the last good password keeps working
+        time.sleep(0.01)
+        with open(os.path.join(d, "login.json"), "w") as f:
+            f.write("{nope")
+        self.assertEqual(L.handle("POST", "/login", Hdr(), "1.2.3.4", form(pw="the second password")).status, 303)
+        # deleting it goes back to setup
+        os.unlink(os.path.join(d, "login.json"))
+        self.assertIn(b"Setup code", L.handle("GET", "/login", Hdr(), "1.2.3.4").body)
+
+    def test_env_hash_wins(self):
+        d = tempfile.mkdtemp()
+        formlogin.write_login_file(d, "me", formlogin.hash_password("file password!!"))
+        with mock.patch.dict(os.environ, {"X_USERNAME": "me", "X_PASSWORD_HASH": HASH}, clear=True):
+            L = formlogin.Login.from_env("X", "app", d)
+        self.assertEqual(L.handle("POST", "/login", Hdr(), "1.2.3.4", form()).status, 303)
+        self.assertEqual(L.handle("POST", "/login", Hdr(), "1.2.3.4", form(pw="file password!!")).status, 401)
+
+    def test_passwd_command(self):
+        d = tempfile.mkdtemp()
+        pointer = os.path.join(d, "pointer.json")
+        with mock.patch.object(formlogin, "POINTER", pointer), \
+                mock.patch.dict(os.environ, {"X_USERNAME": "boss"}, clear=True):
+            L = formlogin.Login.from_env("X", "app", d)
+            with mock.patch("getpass.getpass", return_value="from the command line"):
+                formlogin.main(["passwd"])
+            self.assertEqual(L.handle("POST", "/login", Hdr(), "1.2.3.4",
+                                      form(user="boss", pw="from the command line")).status, 303)
+            with mock.patch.dict(os.environ, {"X_PASSWORD_HASH": HASH}), self.assertRaises(SystemExit):
+                formlogin.main(["passwd"])
+        # without a fixed username it asks, offering the current one
+        with mock.patch("getpass.getpass", return_value="yet another password"), \
+                mock.patch("builtins.input", return_value="") as ask:
+            formlogin.main(["passwd", d])
+        self.assertIn("[boss]", ask.call_args[0][0])
+        self.assertEqual(formlogin.read_login_file(d)["username"], "boss")
+        with mock.patch("getpass.getpass", side_effect=["long enough password", "not the same one"]), \
+                mock.patch("builtins.input", return_value=""), self.assertRaises(SystemExit):
+            formlogin.main(["passwd", d])
 
 
 class HTTPServerAdapter(unittest.TestCase):

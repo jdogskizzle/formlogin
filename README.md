@@ -4,6 +4,21 @@ Form login for small single-user web apps behind a reverse proxy: a sign-in page
 session cookie, a limit on failed logins, and a cross-site check on changes. Standard
 library only. Used by mcpanel, miner, ledger and musicflow.
 
+## Setting the password
+
+In the app's running container, the same command for every app:
+
+    docker compose exec <service> python -m formlogin passwd
+
+It asks for the password (and a username, unless the app's environment fixes one) and
+saves the hash in `login.json` in the app's state folder. The running app uses it right
+away, no restart, and every device is signed out.
+
+A new app with no password yet shows a set-password page instead of the sign-in page.
+It needs the one-time setup code the app prints to its log (`docker logs <container>`),
+so nobody else can claim it first. Forgot the password? Run `passwd` again, or delete
+`login.json` to get the setup page back.
+
 ## What it does
 
 - Every request needs a session except the sign-in page (and whatever the app marks
@@ -12,11 +27,11 @@ library only. Used by mcpanel, miner, ledger and musicflow.
 - Sessions last 30 days, in an `HttpOnly`, `SameSite=Lax` cookie (`Secure` when the
   proxy reports HTTPS) with no `Path`, so the browser scopes it to the folder the app
   is served from and other apps on the same host never see it.
-- They're signed with a random key in a file the app names (made on first start), mixed
-  with the username and password hash. Changing either, or deleting the key file, signs
-  every device out.
-- Failed sign-ins take an extra second, one password check runs at a time, and an
-  address gets 5 failures per 15 minutes (50 for all addresses together pauses sign-in
+- They're signed with a random key (`session.key` in the state folder, made on first
+  start), mixed with the username and password hash. Changing either, or deleting the
+  key, signs every device out.
+- Failed sign-ins (and wrong setup codes) take an extra second, one password check runs
+  at a time, and an address gets 5 failures per 15 minutes (50 for all addresses together pauses sign-in
   for a minute). The address is the last `X-Forwarded-For` entry, so the proxy must set
   that header itself (Caddy does).
 - `POST`s etc. from other sites are refused (`Origin` / `Sec-Fetch-Site`).
@@ -24,15 +39,17 @@ library only. Used by mcpanel, miner, ledger and musicflow.
 
 ## Settings
 
-Each app picks an environment prefix:
+None are needed. Each app picks an environment prefix:
 
 | Variable | |
 |---|---|
-| `<PREFIX>_USERNAME` | Login name |
-| `<PREFIX>_PASSWORD_HASH` | `python -m formlogin hash` makes one (scrypt). Older bcrypt hashes (`$2b$...`) work too where the `bcrypt` package is installed |
+| `<PREFIX>_USERNAME` | Fixes the login name; otherwise it's chosen along with the password |
+| `<PREFIX>_PASSWORD_HASH` | Fixes the password instead of `login.json` (and `passwd` then refuses to change it). `python -m formlogin hash` makes one (scrypt); older bcrypt hashes (`$2b$...`) work where the `bcrypt` package is installed |
 | `<PREFIX>_AUTH` | `off` turns sign-in off, only for apps nothing untrusted can reach. Default `on` |
 
-The app fails to start, with a message saying what's missing, if these aren't usable.
+The app fails to start, with a message saying what's wrong, if these or `login.json`
+aren't usable. A `login.json` changed while it runs that it can't use is ignored (the
+log says why) and the last good password keeps working.
 
 ## Using it
 
@@ -54,7 +71,7 @@ FastAPI / Starlette:
 
 ```python
 import formlogin, formlogin.asgi
-login = formlogin.Login.from_env("LEDGER", "ledger", "/data/session.key",
+login = formlogin.Login.from_env("LEDGER", "ledger", "/data",
                                  title="Server Fund", accent=("#3f7d36", "#6fbf62"))
 formlogin.asgi.install(app, login)
 ```
@@ -63,7 +80,7 @@ formlogin.asgi.install(app, login)
 
 ```python
 import formlogin, formlogin.httpserver
-LOGIN = formlogin.Login.from_env("CONTROL", "miner", "/state/session.key", title="Miner")
+LOGIN = formlogin.Login.from_env("CONTROL", "miner", "/state", title="Miner")
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -72,6 +89,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         ...  # the app; add formlogin.SECURITY_HEADERS to its responses
 ```
+
+The third argument is the state folder: a volume the app keeps, where `login.json` and
+`session.key` go. `passwd` finds it through a note the running app leaves in the
+container's temp folder; outside one, name it: `python -m formlogin passwd <folder>`.
 
 Options for `Login`: `title`, `accent` (light, dark button colour), `icon` (favicon
 URL), and `is_public(method, path, headers, peer)` for requests that need no session,

@@ -30,15 +30,17 @@ button { font: inherit; font-weight: 600; padding: 10px; border-radius: 8px; cur
   background: var(--accent); color: var(--accent-text); border: 0; }
 .err { color: var(--danger); font-size: 14px; margin: 0; }
 .err:empty { display: none; }
+.intro { color: var(--muted); font-size: 14px; margin: 0; }
+code { font-size: 13px; }
 </style>
 </head>
 <body>
 <form method="post" action="login">
   <h1>{{title}}</h1>
+  {{intro}}
   <p class="err" role="alert">{{error}}</p>
-  <label>Username<input name="username" value="{{user}}" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus></label>
-  <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
-  <button type="submit">Sign in</button>
+  {{fields}}
+  <button type="submit">{{button}}</button>
 </form>
 </body>
 </html>

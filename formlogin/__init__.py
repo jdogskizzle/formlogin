@@ -5,14 +5,17 @@ The core here knows nothing about web frameworks. Adapters wire it in:
     formlogin.asgi        FastAPI / Starlette apps
     formlogin.httpserver  apps built on http.server
 
-Settings come from the environment, under a prefix the app picks (e.g. LEDGER):
-    <PREFIX>_USERNAME       login name
-    <PREFIX>_PASSWORD_HASH  made with: python -m formlogin hash
+The password is kept in <state_dir>/login.json. Set or change it inside the running
+container with:
+    python -m formlogin passwd
+With no password yet, the app shows a set-password page that needs the one-time setup
+code it prints to its log. The running app picks up a new password without a restart.
+
+Settings from the environment, under a prefix the app picks (e.g. LEDGER), all optional:
+    <PREFIX>_USERNAME       fixes the login name (otherwise it's chosen with the password)
+    <PREFIX>_PASSWORD_HASH  fixes the password instead of login.json (python -m formlogin hash)
     <PREFIX>_AUTH           "off" turns sign-in off (only if nothing untrusted can reach
                             the app); anything else, or unset, leaves it on
-
-Make a password hash:
-    python -m formlogin hash
 """
 import base64
 import collections
@@ -25,6 +28,7 @@ import json
 import os
 import secrets
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -38,6 +42,11 @@ GLOBAL_LIMIT = 50                     # all addresses together, same window
 MIN_PASSWORD = 12
 MAX_FORM = 4096                       # bytes accepted in a login POST
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 15, 8, 1
+LOGIN_FILE, KEY_FILE = "login.json", "session.key"
+# Where a running app notes its state folder, so `python -m formlogin passwd` run in the
+# same container finds it.
+POINTER = os.path.join(tempfile.gettempdir(), "formlogin.json")
+CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O or 1/I
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 SECURITY_HEADERS = [("X-Content-Type-Options", "nosniff"), ("X-Frame-Options", "DENY"),
                     ("Referrer-Policy", "same-origin")]
@@ -69,8 +78,11 @@ def hash_password(password: str) -> str:
 def _verifier(stored: str):
     """Returns a function password -> bool for a stored hash, or raises ValueError."""
     if stored.startswith("scrypt:"):
-        _, n, r, p, salt, digest = stored.split(":")
-        n, r, p, salt, digest = int(n), int(r), int(p), _unb64(salt), _unb64(digest)
+        try:
+            _, n, r, p, salt, digest = stored.split(":")
+            n, r, p, salt, digest = int(n), int(r), int(p), _unb64(salt), _unb64(digest)
+        except ValueError:
+            raise ValueError("it's not a complete scrypt hash") from None
         return lambda pw: hmac.compare_digest(_scrypt(pw, salt, n, r, p), digest)
     if stored.startswith("$2"):
         # bcrypt hashes from before formlogin still work where the bcrypt package is installed.
@@ -80,6 +92,45 @@ def _verifier(stored: str):
             raise ValueError("it's a bcrypt hash and the bcrypt package isn't installed") from None
         return lambda pw: bcrypt.checkpw(pw.encode(), stored.encode())
     raise ValueError("it isn't a hash made by: python -m formlogin hash")
+
+
+def password_problem(password: str, again: str) -> str:
+    """Why a new password can't be used, or ''."""
+    if len(password) < MIN_PASSWORD:
+        return f"Use at least {MIN_PASSWORD} characters."
+    if password != again:
+        return "The passwords don't match."
+    return ""
+
+
+# ---------------------------------------------------------------- login.json
+
+def read_login_file(state_dir: str) -> dict | None:
+    """{"username", "password_hash"} from state_dir/login.json, or None if there's none."""
+    try:
+        with open(os.path.join(state_dir, LOGIN_FILE)) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise ValueError(f"can't read {LOGIN_FILE}: {e}") from None
+    if not isinstance(data, dict):
+        raise ValueError(f"{LOGIN_FILE} isn't a JSON object")
+    return data
+
+
+def write_login_file(state_dir: str, username: str, password_hash: str) -> None:
+    """Writes login.json in one step (readers see the old or the new file, never half)."""
+    path = os.path.join(state_dir, LOGIN_FILE)
+    fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".login-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump({"username": username, "password_hash": password_hash}, f)
+            f.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 # ---------------------------------------------------------------- request helpers
@@ -143,6 +194,20 @@ def _redirect(where: str, cookie: str | None = None) -> Response:
     return Response(303, headers=headers)
 
 
+def _field(label: str, name: str, kind: str = "text", value: str = "", autocomplete: str = "",
+           autofocus: bool = False) -> str:
+    extra = ' autocapitalize="none" spellcheck="false"' if kind == "text" else ""
+    return (f'<label>{label}<input name="{name}" type="{kind}" value="{html.escape(value)}"'
+            f' autocomplete="{autocomplete}"{extra} required{" autofocus" if autofocus else ""}></label>')
+
+
+@dataclass
+class _Creds:
+    username: str
+    check: object  # password -> bool
+    key: bytes     # session-signing key
+
+
 # ---------------------------------------------------------------- login
 
 class Login:
@@ -153,11 +218,14 @@ class Login:
     Routes it answers itself: GET/POST /login, POST /logout.
     """
 
-    def __init__(self, app: str, username: str, password_hash: str, key_file: str, *,
+    def __init__(self, app: str, state_dir: str, *, username: str | None = None,
+                 password_hash: str | None = None, prefix: str | None = None,
                  title: str | None = None, accent: tuple[str, str] = ("#2563eb", "#60a5fa"),
                  icon: str = "", is_public=None, enabled: bool = True):
         """app: short name, used in the cookie name and messages.
-        key_file: where the random session-signing key is kept (made on first start).
+        state_dir: a folder the app keeps (volume): login.json and session.key go there.
+        username / password_hash: fixed values that override login.json (e.g. from .env).
+        prefix: the environment prefix, so `formlogin passwd` can respect fixed values.
         title: shown on the sign-in page. accent: (light, dark) button colour.
         icon: favicon href, e.g. a data: URI.
         is_public(method, path, headers, peer) -> bool: requests that need no session.
@@ -171,16 +239,16 @@ class Login:
                      .replace("{{accent}}", accent[0]).replace("{{accent_dark}}", accent[1]))
         if not enabled:
             return
-        if not username:
-            raise SystemExit(f"{app}: the login username is not set")
-        try:
-            self._check = _verifier(password_hash or "")
-        except ValueError as e:
-            raise SystemExit(f"{app}: the password hash is not usable: {e}. "
-                             "Make one with: python -m formlogin hash")
-        self.username = username
-        # Sessions are signed with a random key from key_file, mixed with the username and
-        # password hash, so changing either signs everyone out (so does deleting key_file).
+        self.state_dir = state_dir
+        self._fixed_user = username or None
+        self._fixed_hash = password_hash or None
+        if self._fixed_hash and not self._fixed_user:
+            raise SystemExit(f"{app}: a fixed password hash needs a fixed username too")
+        if not os.path.isdir(state_dir):
+            raise SystemExit(f"{app}: the state folder {state_dir} doesn't exist (mount a volume there)")
+        # Sessions are signed with a random key from session.key, mixed with the username and
+        # password hash, so changing either signs everyone out (so does deleting the key).
+        key_file = os.path.join(state_dir, KEY_FILE)
         try:
             fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as f:
@@ -190,42 +258,113 @@ class Login:
         except OSError as e:
             raise SystemExit(f"{app}: can't create the session key {key_file}: {e}")
         with open(key_file, "rb") as f:
-            secret = f.read()
-        self._key = hmac.new(secret, f"{app}\0{username}\0{password_hash}".encode(),
-                             hashlib.sha256).digest()
+            self._secret = f.read()
+        self._load_lock = threading.Lock()
         self._check_lock = threading.Lock()  # one password check at a time
         self._fails = collections.defaultdict(collections.deque)
         self._fail_lock = threading.Lock()
+        self._mtime = self._setup_code = self._creds = None
+        try:
+            self._creds = self._load()
+        except ValueError as e:
+            raise SystemExit(f"{app}: {e}")
+        self._mtime = self._file_mtime()
+        if self._creds is None:
+            self._start_setup()
+        try:  # so `python -m formlogin passwd` in this container finds the state folder
+            with open(POINTER, "w") as f:
+                json.dump({"app": app, "prefix": prefix, "state_dir": os.path.abspath(state_dir)}, f)
+        except OSError:
+            pass
 
     @classmethod
-    def from_env(cls, prefix: str, app: str, key_file: str, **kw) -> "Login":
-        """Reads <prefix>_USERNAME, <prefix>_PASSWORD_HASH and <prefix>_AUTH."""
+    def from_env(cls, prefix: str, app: str, state_dir: str, **kw) -> "Login":
+        """Reads <prefix>_USERNAME, <prefix>_PASSWORD_HASH and <prefix>_AUTH (all optional)."""
         mode = (os.environ.get(f"{prefix}_AUTH") or "on").strip().lower()
         if mode not in ("on", "off"):
             raise SystemExit(f"{app}: {prefix}_AUTH must be on or off")
         if mode == "off":
-            return cls(app, "", "", key_file, enabled=False, **kw)
+            return cls(app, state_dir, enabled=False, **kw)
         user = (os.environ.get(f"{prefix}_USERNAME") or "").strip()
         pw_hash = (os.environ.get(f"{prefix}_PASSWORD_HASH") or "").strip()
-        if not user or not pw_hash:
-            raise SystemExit(f"{app}: set {prefix}_USERNAME and {prefix}_PASSWORD_HASH "
-                             f"(or {prefix}_AUTH=off if only trusted machines can reach it). "
-                             "Make the hash with: python -m formlogin hash")
-        return cls(app, user, pw_hash, key_file, **kw)
+        if pw_hash and not user:
+            raise SystemExit(f"{app}: {prefix}_PASSWORD_HASH is set, so set {prefix}_USERNAME too")
+        return cls(app, state_dir, username=user, password_hash=pw_hash, prefix=prefix, **kw)
+
+    # -------------------------------------------------- credentials
+
+    def _file_mtime(self):
+        try:
+            return os.stat(os.path.join(self.state_dir, LOGIN_FILE)).st_mtime_ns
+        except OSError:
+            return None
+
+    def _load(self) -> _Creds | None:
+        """The current username and password, or None while none is set. Raises ValueError."""
+        if self._fixed_hash:
+            user, pw_hash = self._fixed_user, self._fixed_hash
+        else:
+            data = read_login_file(self.state_dir)
+            if data is None:
+                return None
+            user = self._fixed_user or str(data.get("username") or "")
+            pw_hash = str(data.get("password_hash") or "")
+            if not user:
+                raise ValueError(f"{LOGIN_FILE} has no username")
+        try:
+            check = _verifier(pw_hash)
+        except ValueError as e:
+            raise ValueError(f"the password hash is not usable: {e}") from None
+        key = hmac.new(self._secret, f"{self.app}\0{user}\0{pw_hash}".encode(), hashlib.sha256).digest()
+        return _Creds(user, check, key)
+
+    def current(self) -> _Creds | None:
+        """Credentials, re-read when login.json changes (so a new password applies at once)."""
+        if self._fixed_hash:
+            return self._creds
+        mtime = self._file_mtime()
+        if mtime != self._mtime:
+            with self._load_lock:
+                if mtime != self._mtime:
+                    self._mtime = mtime
+                    try:
+                        self._creds = self._load()
+                    except ValueError as e:  # keep what worked; say why
+                        print(f"{self.app}: ignoring the changed {LOGIN_FILE}: {e}",
+                              file=sys.stderr, flush=True)
+                    else:
+                        if self._creds is None:
+                            self._start_setup()
+                        else:
+                            self._setup_code = None
+                            print(f"{self.app}: new password in use; earlier sessions are signed out",
+                                  file=sys.stderr, flush=True)
+        return self._creds
+
+    def _start_setup(self) -> None:
+        code = "".join(secrets.choice(CODE_CHARS) for _ in range(10))
+        self._setup_code = code
+        print(f"{self.app}: no password is set yet. Open the app and use setup code "
+              f"{code[:5]}-{code[5:]}, or set one with: python -m formlogin passwd "
+              "(in this container)", file=sys.stderr, flush=True)
 
     # -------------------------------------------------- sessions
 
-    def _sign(self, msg: str) -> str:
-        return _b64(hmac.new(self._key, msg.encode(), hashlib.sha256).digest())
+    def _sign(self, key: bytes, msg: str) -> str:
+        return _b64(hmac.new(key, msg.encode(), hashlib.sha256).digest())
 
-    def new_session(self) -> str:
+    def new_session(self, creds: _Creds | None = None) -> str:
+        creds = creds or self.current()
         msg = f"{int(time.time()) + SESSION_DAYS * 86400}.{_b64(secrets.token_bytes(9))}"
-        return f"{msg}.{self._sign(msg)}"
+        return f"{msg}.{self._sign(creds.key, msg)}"
 
     def valid(self, token: str | None) -> bool:
+        creds = self.current()
+        if creds is None:
+            return False
         try:
             expires, nonce, sig = (token or "").split(".")
-            return (hmac.compare_digest(sig, self._sign(f"{expires}.{nonce}"))
+            return (hmac.compare_digest(sig, self._sign(creds.key, f"{expires}.{nonce}"))
                     and int(expires) > time.time())
         except ValueError:
             return False
@@ -257,23 +396,48 @@ class Login:
                 return int(FAIL_WINDOW - (now - mine[0])) + 1
             return 60 if sum(map(len, self._fails.values())) >= GLOBAL_LIMIT else 0
 
+    def _failed(self, ip: str) -> None:
+        with self._fail_lock:
+            self._fails[ip].append(time.time())
+        time.sleep(FAIL_DELAY)
+
     def check(self, ip: str, username: str, password: str) -> bool:
         """Blocks for the hash check (and FAIL_DELAY on failure); run it off the event loop."""
+        creds = self.current()
+        if creds is None:
+            return False
         with self._check_lock:
-            ok_pw = self._check(password)  # always run, so a wrong name takes as long
-            ok = hmac.compare_digest(username.encode(), self.username.encode()) and ok_pw
+            ok_pw = creds.check(password)  # always run, so a wrong name takes as long
+            ok = hmac.compare_digest(username.encode(), creds.username.encode()) and ok_pw
             if not ok:
-                with self._fail_lock:
-                    self._fails[ip].append(time.time())
-                time.sleep(FAIL_DELAY)
+                self._failed(ip)
         return ok
 
-    # -------------------------------------------------- requests
+    # -------------------------------------------------- pages
+
+    def _page(self, intro: str, fields: list[str], button: str, error: str, status: int) -> Response:
+        body = (self.page.replace("{{intro}}", f'<p class="intro">{intro}</p>' if intro else "")
+                .replace("{{fields}}", "\n  ".join(fields)).replace("{{button}}", button)
+                .replace("{{error}}", html.escape(error))).encode()
+        return Response(status, body, "text/html; charset=utf-8", [("Cache-Control", "no-store")])
 
     def login_page(self, error: str = "", username: str = "", status: int = 200) -> Response:
-        body = (self.page.replace("{{error}}", html.escape(error))
-                .replace("{{user}}", html.escape(username))).encode()
-        return Response(status, body, "text/html; charset=utf-8", [("Cache-Control", "no-store")])
+        return self._page("", [
+            _field("Username", "username", value=username, autocomplete="username", autofocus=True),
+            _field("Password", "password", "password", autocomplete="current-password"),
+        ], "Sign in", error, status)
+
+    def setup_page(self, error: str = "", username: str = "", status: int = 200) -> Response:
+        fields = [_field("Setup code", "code", autocomplete="off", autofocus=True)]
+        if not self._fixed_user:
+            fields.append(_field("Username", "username", value=username, autocomplete="username"))
+        fields += [_field("New password", "password", "password", autocomplete="new-password"),
+                   _field("New password again", "again", "password", autocomplete="new-password")]
+        return self._page("No password is set yet. The setup code is in the app's log "
+                          "(<code>docker logs &lt;container&gt;</code>).",
+                          fields, "Set password and sign in", error, status)
+
+    # -------------------------------------------------- requests
 
     def needs_body(self, method: str, path: str) -> bool:
         """Whether handle() needs the request body (only for a sign-in attempt)."""
@@ -292,7 +456,7 @@ class Login:
                 return self._submit(headers, peer, body)
             if self.signed_in(headers):
                 return _redirect("./")
-            return self.login_page()
+            return self.setup_page() if self.current() is None else self.login_page()
         if path == "/logout" and method == "POST":
             return _redirect("login", self._cookie(headers, "", 0))
         if self.signed_in(headers) or self.is_public(method, path, headers, peer):
@@ -302,32 +466,94 @@ class Login:
         return _redirect(_to_root(path) + "login")
 
     def _submit(self, headers, peer: str, body: bytes) -> Response:
+        setup = self.current() is None
+        page = self.setup_page if setup else self.login_page
         if len(body) > MAX_FORM:
-            return self.login_page("Too long.", status=413)
-        form = parse_qs(body.decode(errors="replace"))
-        name = (form.get("username") or [""])[0].strip()
-        password = (form.get("password") or [""])[0]
+            return page("Too long.", status=413)
+        form = {k: v[0] for k, v in parse_qs(body.decode(errors="replace")).items()}
+        name = form.get("username", "").strip()
         ip = client_ip(headers, peer)
         wait = self.blocked(ip)
         if wait:
-            return self.login_page(f"Too many failed attempts. Try again in {wait // 60 + 1} min.",
-                                   name, 429)
-        if not self.check(ip, name, password):
+            return page(f"Too many failed attempts. Try again in {wait // 60 + 1} min.", name, 429)
+        if setup:
+            return self._setup(headers, ip, form, name)
+        if not self.check(ip, name, form.get("password", "")):
             print(f"{self.app}: failed login from {ip}", file=sys.stderr, flush=True)
             return self.login_page("Wrong username or password.", name, 401)
         print(f"{self.app}: signed in from {ip}", file=sys.stderr, flush=True)
         return _redirect("./", self._cookie(headers, self.new_session(), SESSION_DAYS * 86400))
 
+    def _setup(self, headers, ip: str, form: dict, name: str) -> Response:
+        given = form.get("code", "").upper().replace("-", "").replace(" ", "")
+        with self._check_lock:
+            code = self._setup_code
+            if code is None:  # a password was set meanwhile
+                return _redirect("login")
+            if not hmac.compare_digest(given.encode(), code.encode()):
+                print(f"{self.app}: wrong setup code from {ip}", file=sys.stderr, flush=True)
+                self._failed(ip)
+                return self.setup_page("Wrong setup code.", name, 401)
+            user = self._fixed_user or name
+            if not user:
+                return self.setup_page("Choose a username.", name, 400)
+            problem = password_problem(form.get("password", ""), form.get("again", ""))
+            if problem:
+                return self.setup_page(problem, name, 400)
+            write_login_file(self.state_dir, user, hash_password(form["password"]))
+        creds = self.current()
+        print(f"{self.app}: password set from {ip}", file=sys.stderr, flush=True)
+        return _redirect("./", self._cookie(headers, self.new_session(creds), SESSION_DAYS * 86400))
+
 
 # ---------------------------------------------------------------- command line
 
+def _ask_password() -> str:
+    pw = getpass.getpass("New password: ")
+    problem = password_problem(pw, pw) or password_problem(pw, getpass.getpass("Again: "))
+    if problem:
+        raise SystemExit(problem)
+    return pw
+
+
+def passwd(state_dir: str | None = None) -> None:
+    """Sets the password (and the username, unless the environment fixes it) in login.json."""
+    prefix = None
+    if state_dir is None:
+        try:
+            with open(POINTER) as f:
+                where = json.load(f)
+            state_dir, prefix = where["state_dir"], where.get("prefix")
+        except (OSError, ValueError, KeyError):
+            raise SystemExit("Can't tell where this app keeps its login. Run this in the app's "
+                             "running container (docker compose exec <service> python -m "
+                             "formlogin passwd), or name the folder: python -m formlogin "
+                             "passwd <state folder>")
+    if prefix and os.environ.get(f"{prefix}_PASSWORD_HASH"):
+        raise SystemExit(f"{prefix}_PASSWORD_HASH is set in the app's environment (.env), and it "
+                         "takes priority. Remove it there and restart the app, then run this again.")
+    fixed_user = (os.environ.get(f"{prefix}_USERNAME") or "").strip() if prefix else ""
+    try:
+        old = read_login_file(state_dir) or {}
+    except ValueError:
+        old = {}
+    if fixed_user:
+        print(f"Username: {fixed_user} (set by {prefix}_USERNAME)")
+        user = fixed_user
+    else:
+        current = old.get("username") or ""
+        user = input(f"Username [{current}]: " if current else "Username: ").strip() or current
+        if not user:
+            raise SystemExit("A username is needed.")
+    write_login_file(state_dir, user, hash_password(_ask_password()))
+    print("Password saved. The app uses it right away; every device is signed out.")
+
+
 def main(argv=None) -> None:
     argv = sys.argv[1:] if argv is None else argv
-    if argv != ["hash"]:
-        raise SystemExit("usage: python -m formlogin hash")
-    pw = getpass.getpass("New password: ")
-    if len(pw) < MIN_PASSWORD:
-        raise SystemExit(f"Use at least {MIN_PASSWORD} characters.")
-    if getpass.getpass("Again: ") != pw:
-        raise SystemExit("The passwords don't match.")
-    print(hash_password(pw))
+    if argv[:1] == ["passwd"] and len(argv) <= 2:
+        return passwd(argv[1] if len(argv) == 2 else None)
+    if argv == ["hash"]:
+        return print(hash_password(_ask_password()))
+    raise SystemExit("usage: python -m formlogin passwd [state folder]   set the password\n"
+                     "       python -m formlogin hash                    print a hash for .env")

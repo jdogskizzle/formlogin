@@ -1,7 +1,7 @@
 """formlogin for apps built on http.server.BaseHTTPRequestHandler:
 
     import formlogin, formlogin.httpserver
-    LOGIN = formlogin.Login.from_env("CONTROL", "miner", "/state/session.key", title="Miner")
+    LOGIN = formlogin.Login.from_env("CONTROL", "miner", "/state", title="Miner")
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
